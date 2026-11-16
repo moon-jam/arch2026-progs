@@ -53,13 +53,15 @@ gcd_u32_asm:
     CTZ     t0, t1
     srl     a0, a0, t1
 .Lloop:
-    mv      t0, a1              # b >>= ctz(b)
-    CTZ     t0, t1
-    srl     a1, a1, t1
-    bgeu    a1, a0, .Lnoswap    # if (a > b) swap; unsigned compare
-    mv      t0, a0
-    mv      a0, a1
-    mv      a1, t0
+    andi    t0, a1, 1           # while b is even: b >>= 1
+    bnez    t0, .Lodd           # b - a has only a few zeros on average
+    srli    a1, a1, 1
+    j       .Lloop
+.Lodd:
+    bgeu    a1, a0, .Lnoswap    # a > b: the new pair is (b, a - b)
+    sub     a1, a0, a1          # a1 = a - b, nonzero and even
+    sub     a0, a0, a1          # a0 = a - (a - b) = b, no temporary
+    j       .Lloop
 .Lnoswap:
     sub     a1, a1, a0          # b -= a
     bnez    a1, .Lloop
