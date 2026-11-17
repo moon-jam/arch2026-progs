@@ -329,3 +329,142 @@ The worst calls of the assembly are 14, 141 and 86 instructions, within the budg
 ### Applications
 
 BFloat16 is used to train and run neural networks. There, range matters more than precision. Since BFloat16 keeps the exponent of a 32-bit float, converting between the two only means keeping or dropping the lower 16 bits.
+
+## 2x2x2 Rubik's Cube Solver (`rubik`)
+
+Source: [`rubik.c`](https://github.com/moon-jam/arch2026-progs/blob/f9e88297925129020e13a65688287a3d9434c095/src/rubik/rubik.c), [`rubik.S` ported](https://github.com/moon-jam/arch2026-progs/blob/17891b21897194e4d110fdeb5c3ac51c51e6514a/src/rubik/rubik.S), [`rubik.S` after A and B](https://github.com/moon-jam/arch2026-progs/blob/b0b1dc08b32c9858a2ced4ccf225e82b940a6286/src/rubik/rubik.S), [`rubik.S` final](https://github.com/moon-jam/arch2026-progs/blob/9ea9e1495f768c85d48c4c9d660af736f2043d1b/src/rubik/rubik.S)
+
+### Principle
+
+The solver comes from Homework 1, where its design is explained in full: [moon-jam/minirubik](https://github.com/moon-jam/minirubik). In short, a state is two numbers, the rank of the corner permutation and the rank of the corner twists, so a move is two table lookups. The search is IDA\*, with two lower bounds: the moves needed to solve the permutation alone, and the distance to the subgroup $\langle R2, B2, D2 \rangle$, stored modulo 3 in 2 bits per entry. The tables take 95,667 bytes, and none of them stores a move for every state.
+
+This section only describes how the solver was ported to this assignment and made faster.
+
+### C version
+
+The C version keeps the search of Homework 1 and adds the contract's interface:
+
+- It checks the 14 characters while reading them: digits in range, no repeated corner, twists that add up to a multiple of 3. Reading stops at the first bad character, so a short string is never read past its end.
+- The search uses one frame per depth in a fixed array and a loop, not recursion. This fits easily in the 4 KiB stack.
+- Before writing the answer, it counts how many bytes the move names, spaces and the final NUL need. If they do not fit in `cap`, it returns $-2$ and writes nothing but `out[0] = '\0'`. It returns $-1$ for an invalid state and leaves `out` untouched.
+- It needs no multiply at all. A face selects its table row through an array of row pointers instead of computing `face * 5040`, and the permutation rank is built with shifts and adds.
+
+### Assembly against GCC
+
+The assembly started as the hand-written solver of Homework 1, [`solver-rv32i.s`](https://github.com/moon-jam/minirubik/blob/bbc2197b5888447bb7fcc15d16efd67eb2898829/solver-rv32i.s). Ported as it was, it took 6,479 instructions per call. The best C build here is `-O3` at 5,793, which inlines all small functions and keeps more values in registers. So the port was 12% slower and would have failed the grader.
+
+### Optimizations
+
+Five changes made it faster than `-O3`. Each diff compares the Homework 1 code (`-`) with the new code (`+`).
+
+**A. Rank by shifts and adds.** The permutation rank is built as $((d_0 \cdot 6 + d_1) \cdot 5 + d_2) \cdots$, which needs a multiply for each digit. Homework 1 multiplied by repeated addition, a loop that ran 27 times in total. The new code multiplies by 6, 5, 4, 3 and 2 with shifts and adds, as the C version does. For example, $6p = 4p + 2p$:
+
+```diff
+-    li      t1, 7               # rank = (7 - i) * rank + digit, by addition
+-    sub     t1, t1, t2
+-    li      t3, 0
+-.Lrank_mul:
+-    beqz    t1, .Lrank_add
+-    add     t3, t3, a0
+-    addi    t1, t1, -1
+-    j       .Lrank_mul
++    lbu     t1, 1(t0)
++    slli    t2, a0, 2           # 6p + d
++    slli    a0, a0, 1
++    add     a0, a0, t2
++    add     a0, a0, t1
++    ...                         # then 5p + d, 4p + d, 3p + d, 2p + d
+```
+
+**B. Inline the lookups when finding the start distance.** Walking into $H$ tries up to 9 moves per step. Homework 1 called a helper function for each move and for each remainder lookup. Every call loaded the table addresses again, and the candidate state had to be kept on the stack, because a call overwrites the temporary registers. The new code puts the lookups inline, loads the rows of a face once, and keeps everything in registers. The function now needs no stack frame:
+
+```diff
+ .Lroot_turn:
+-    mv      a0, s6
+-    lw      a1, 12(sp)
+-    mv      a2, s5
+-    call    quarter_rank
+-    mv      s6, a0
+-    sw      a1, 12(sp)
+-    call    half_remainder
++    slli    t1, a6, 1           # one more quarter turn
++    add     t1, t3, t1          # t3, t4: rows of this face
++    lhu     a6, 0(t1)
++    slli    t1, a7, 1
++    add     t1, t4, t1
++    lhu     a7, 0(t1)
++    ...                         # the remainder lookup, also inline
+```
+
+Together, A and B brought the cost per call from 6,479 to 5,943.
+
+**C. Look up the distance change.** A remainder change of $-2$ means the distance went up by one, and $+2$ means it went down by one. Homework 1 handled these two cases with two compares and branches. The new code reads the answer from a 5-byte table, indexed by the change plus 2:
+
+```diff
+     sub     t1, s9, t0          # new remainder - old remainder
+-    li      t2, -2
+-    bne     t1, t2, 4f
+-    li      t1, 1
+-4:
+-    li      t2, 2
+-    bne     t1, t2, 5f
+-    li      t1, -1
+-5:
++    add     t1, t1, s10         # s10 = delta_table: 1, -1, 0, 1, -1
++    lb      t1, 2(t1)
+```
+
+**D. Compute the move number only when it is recorded.** Homework 1 computed $3 \cdot \text{face} + \text{turn}$ for every move it tried. Most tried moves are cut off right away, so the number is never used. The new code computes it only when a move is kept in the solution, which also frees `s10` for the table of C:
+
+```diff
+     lbu     t0, 11(s5)
+-    slli    t1, s8, 1           # move = 3 * face + turn, for every move
+-    add     t1, t1, s8
+-    add     s10, t1, t0
+     addi    t0, t0, 1
+```
+
+**E. Retry the same face directly.** When a move is cut off, Homework 1 went back to the top of the node, which checks the face again and reloads the frame. If the same face still has turns left, none of that is needed, so the new code jumps straight to the next turn:
+
+```diff
+     add     t1, t0, a0
+-    blt     s3, t1, .Lsearch_node
++    blt     s3, t1, .Lsearch_retry
+     ...
++.Lsearch_retry:                 # cut off: the same face again if turns remain
++    lbu     t1, 11(s5)
++    bnez    t1, .Lsearch_turn
++    j       .Lsearch_node
+```
+
+Together, C, D and E brought the cost per call from 5,943 to 5,389.
+
+### Results
+
+Cost per call over the 6 bench states (instructions):
+
+| -O1 | -O2 | -O3 | -Os | asm |
+|---|---|---|---|---|
+| 7,883.3 | 6,167.7 | 5,793.5 | 8,708.7 | 5,388.7 |
+
+The assembly is 1.08x faster than the best C build (`-O3`). Every test state stays within the budgets: 7.5 million instructions for the assembly and 50 million for the C version, including all states at distance 11.
+
+Static footprint (bytes, `size -A`), against the limit of 131,072:
+
+| | `.text` | `.rodata` | `.bss` | total |
+|---|---|---|---|---|
+| -O1 | 2,232 | 95,667 | 0 | 97,899 |
+| -O2 | 1,648 | 95,667 | 0 | 97,315 |
+| -O3 | 2,892 | 95,667 | 0 | 98,559 |
+| -Os | 1,632 | 95,667 | 0 | 97,299 |
+| asm | 1,728 | 95,667 | 208 | 97,603 |
+
+The tables dominate every version. The assembly keeps its search frames in `.bss` (208 bytes), while the C version keeps them on the stack.
+
+### Verification
+
+`make grade` passes `rubik` at all four levels (`rubik PASS 15.0/15`). The tests solve 59 states from distance 0 to 11 and check that each answer parses, solves the cube, and has exactly the shortest length. They also cover all 9 single moves, 13 invalid states and every buffer size around the exact fit. `make sanitize` reports no errors.
+
+### Applications
+
+The same ideas solve larger puzzles. Optimal solvers for the 3x3x3 cube, such as Korf's, also run IDA\* with pattern databases as lower bounds. The trade-off is the same as here: a bigger table gives a tighter bound and a faster search, but it has to fit in memory.
