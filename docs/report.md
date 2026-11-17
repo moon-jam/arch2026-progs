@@ -11,7 +11,7 @@ Contributed by <[`moon-jam`](https://github.com/moon-jam)>
 |---|---|
 | Compiler | `riscv-none-elf-gcc` 14.2.0 (xPack) |
 | Flags | `-march=rv32i_zicsr -mabi=ilp32 -ffreestanding`, at `-O1`, `-O2`, `-O3`, `-Os` |
-| Emulator | rv32emu `9dbff65`, system emulation with `ELF_LOADER`, no M, A, F or C extension |
+| Emulator | rv32emu [`9dbff65`](https://github.com/sysprog21/rv32emu/commit/9dbff65c4d6a40d64d3bbb38f4c5a20d6e885e24) (2026-11-10), system emulation with `ELF_LOADER`, no M, A, F or C extension |
 
 The timing code comes with the harness ([`common/bench.h`](https://github.com/moon-jam/arch2026-progs/blob/fd2d7c17db223807c342e3f210c769d23d1865b1/common/bench.h), called from [`tests/mgcd.c`](https://github.com/moon-jam/arch2026-progs/blob/fd2d7c17db223807c342e3f210c769d23d1865b1/tests/mgcd.c) and the other test programs). It runs a loop that calls the function once for each of a fixed set of inputs and reads the cycle counter before and after. It then runs the same loop with the call replaced by a plain copy of the input, which measures the loop and the counter reads alone. The second count is subtracted from the first and divided by the number of calls, so the per-call figures below count only the function itself.
 
