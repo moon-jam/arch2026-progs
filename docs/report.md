@@ -178,3 +178,154 @@ The speedup is against the best C build of each function. The worst calls found 
 ### Applications
 
 Fixed-point arithmetic is how processors without a floating-point unit handle fractions, in microcontrollers, digital signal processing and audio codecs. A Q format trades range for precision at a fixed point, so the format is chosen to fit the data, and the choice between wrapping and saturating on overflow matters: audio code usually saturates, because a wrapped sample turns into a loud click.
+
+## BFloat16 (`bf16`)
+
+Source: [`bf16.c`](https://github.com/moon-jam/arch2026-progs/blob/dda9a203ed15b73f7c1f839c9f70210be06f05c4/src/bf16/bf16.c), [`bf16.S`](https://github.com/moon-jam/arch2026-progs/blob/9c256e0d6204810d7058f8d3a57521594f5aa554/src/bf16/bf16.S)
+
+### Format
+
+BFloat16 is the upper half of a 32-bit float. It has one sign bit, 8 exponent bits with a bias of 127, and 7 fraction bits. A normal value is
+
+$$(-1)^S \times 1.F \times 2^{E - 127}.$$
+
+Because the exponent is the same as in a 32-bit float, the range is the same, about $10^{\pm 38}$.
+
+Two exponent values are special:
+
+- Exponent `0xFF`: Inf if the fraction is zero, NaN otherwise.
+- Exponent 0: zero if the fraction is zero, otherwise a subnormal value, which has no hidden leading one.
+
+The code never uses a `float` in arithmetic. Every value is handled as its bit pattern.
+
+### Converting binary32 to BF16 (`bf16_from_f32`)
+
+The conversion keeps the upper 16 bits of the 32-bit float and rounds away the lower 16 bits. The rounding is done by one addition before the shift:
+
+```c
+f32bits += 0x7FFF + ((f32bits >> 16) & 1);
+```
+
+- If the lower half is less than `0x8000`, adding `0x7FFF` does not carry into the upper half, so the value is rounded down.
+- If the lower half is more than `0x8000`, it carries, so the value is rounded up.
+- If the lower half is exactly `0x8000`, it is a tie. Then bit 16, the last kept bit, decides: an odd value carries and becomes even, and an even value stays.
+
+This is round to nearest, ties to even, so the error is at most half a unit in the last place. Inf and NaN are returned before the addition, so that a NaN cannot be rounded into Inf.
+
+### Multiply (`bf16_mul`)
+
+The multiply follows the contract step by step:
+
+1. The sign of the result is the XOR of the two signs.
+2. Special values are checked for `a` first, then for `b`. Because of this order, Inf times NaN gives Inf: once `a` is Inf, `b` is never looked at.
+3. Zero times a finite value gives zero with the result's sign.
+4. The hidden leading one is added back to each fraction. A subnormal operand has no leading one, so its fraction is shifted left until it has one, and its exponent goes down by one per shift.
+5. The two 8-bit values are multiplied. The product is between $2^{14}$ and $2^{16}$, so at most one shift brings it back into place.
+6. The extra fraction bits are cut off (truncated), not rounded. The error is therefore less than one unit in the last place.
+7. The exponent is $E_a + E_b - 127$. Both exponents carry the bias of 127, so their sum carries it twice, and one is subtracted.
+8. If the exponent reaches 255, the result is Inf. If it is 0 or less, the result becomes subnormal, or zero when it is too small.
+
+### Square root (`bf16_sqrt`)
+
+The square root splits the value into its exponent and its significand:
+
+$$\sqrt{2^e \cdot m} = 2^{e/2} \cdot \sqrt{m}.$$
+
+The exponent $e$ must be even to be halved. When it is odd, the significand is doubled and the exponent lowered by one, which keeps the same value. Here $m$ is the significand with the hidden leading one added back, `0x80 | F`. The contract does not say this step in words, but it follows from its use of "significand" and from its result range of [128, 256), whose top bit is that leading one. After this, $m$ is between 128 and 255 for an even exponent, or between 256 and 510 after doubling, read as a number with 7 fraction bits.
+
+The contract defines the result as the largest $r$ with $\lfloor r^2 / 128 \rfloor \le m$. The C version finds it by binary search over $[90, 256]$, which takes up to 8 steps. Each step computes `mid * mid`. RV32I has no multiply instruction, so this is a call to `__mulsi3`, which is itself a loop.
+
+The result is always between 128 and 255. Since $m \ge 128$, $r = 128$ always satisfies the condition, so the largest $r$ is at least 128. The smaller values in the search range also satisfy it, but they are never the largest. And $r = 256$ gives $256^2 / 128 = 512 > m$, so it never does. So the result never needs to be normalized again.
+
+### Assembly against GCC
+
+**bf16_from_f32.** Both versions use 11 instructions. The only difference is the test for Inf and NaN. The assembly shifts the sign bit out, which moves the exponent to the top 8 bits. Then a single unsigned compare with `0xFF000000` tells whether the exponent is all ones:
+
+```asm
+    slli    t0, a0, 1           # drop the sign: exponent in bits 31..24
+    lui     t1, 0xFF000
+    bgeu    t0, t1, 1f          # exponent 0xFF: Inf or NaN, no rounding
+```
+
+GCC uses `and` and `beq` instead, which is also 3 instructions. So this function can only tie with the compiler.
+
+**bf16_mul and bf16_sqrt.** GCC calls `__mulsi3` in both functions: once for the product in the multiply, and once in every step of the square root's search. The assembly removes these calls. The next section explains how.
+
+### Optimizations
+
+**A. Inline multiply.** To call `__mulsi3`, GCC has to save registers. At every optimization level, its multiply opens a 32-byte stack frame and saves `ra` and `s0` to `s3`. That is 10 extra loads and stores per call.
+
+The assembly does the 8-bit by 8-bit product itself, with a loop of 8 shift-and-add steps. Everything stays in registers, so there is no stack frame. The rare cases (special values, subnormal operands, overflow) are placed after the `ret` of the normal case, so a normal multiply runs straight through without jumping.
+
+One small trick is the test for zero. Both +0 and -0 have all bits zero except the sign, so the test is `(a & 0x7FFF) == 0`. But `0x7FFF` does not fit in the 12-bit immediate of `andi`, and loading it first would take two more instructions. Instead, the code shifts the 16-bit value left by 17 with `slli t3, a0, 17`. The sign bit moves past bit 31 and is dropped, and the low 15 bits move to the top. The result is zero exactly when those 15 bits are zero, so one instruction does the test.
+
+Result: the cost per call drops from 95.0 instructions (best C build) to 65.7. The worst call over the four builds drops from 179 to 141.
+
+**B. Digit-by-digit square root.** The binary search needs a multiply in every step. The assembly avoids multiplying at all. First, the contract's condition can be rewritten:
+
+$$\left\lfloor \frac{r^2}{128} \right\rfloor \le m \iff r^2 < 128(m+1) \iff r^2 \le N, \qquad N = 128m + 127.$$
+
+So the result is simply the integer square root of $N$. Since $N < 2^{16}$, the root has 8 bits.
+
+The assembly finds these 8 bits one at a time, starting from the top. Let $R$ be the bits found so far. Setting the next bit $k$ makes the square grow by
+
+$$(R + 2^k)^2 - R^2 = 2R \cdot 2^k + 4^k.$$
+
+The bit is kept if this amount still fits in what is left, $N - R^2$. Otherwise the bit stays 0.
+
+Computing $2R \cdot 2^k$ directly would need a multiply. Instead, the loop keeps two registers with these values at the start of the step for bit $k$:
+
+$$t_2 = 2R \cdot 2^k, \qquad t_3 = 4^k.$$
+
+Then the amount is just $t_2 + t_3$, one addition.
+
+Why can the loop keep these values without multiplying? The next step handles bit $k - 1$. Let $R'$ be the root after this step. The next step needs $t_2' = 2R' \cdot 2^{k-1} = R' \cdot 2^k$. There are two cases:
+
+- The bit is not kept. Then $R' = R$, and $t_2' = R \cdot 2^k = t_2 / 2$.
+- The bit is kept. Then $R' = R + 2^k$, and $t_2' = (R + 2^k) \cdot 2^k = R \cdot 2^k + 4^k = t_2 / 2 + t_3$.
+
+So each step does the following:
+
+- Shift $t_2$ right by one (`srli t2, t2, 1`).
+- If the bit is kept, add $t_3$ to $t_2$ (`add t2, t2, t3`), and subtract the amount from what is left (`sub t1, t1, t4`).
+- Shift $t_3$ right by two, from $4^k$ to $4^{k-1}$ (`srli t3, t3, 2`).
+
+At the start, $R = 0$, so $t_2 = 0$. After the last step, for bit 0, $t_2 = 2R \cdot 2^{-1} = R$, which is the root. $t_2$ is always even before it is shifted, so no bit is lost. The whole loop uses only additions, subtractions and shifts:
+
+```asm
+3:
+    add     t4, t2, t3          # (R + 2^k)^2 - R^2
+    srli    t2, t2, 1
+    bltu    t1, t4, 4f          # does it fit in what is left?
+    sub     t1, t1, t4
+    add     t2, t2, t3          # yes: keep bit k
+4:
+    srli    t3, t3, 2           # 4^k -> 4^(k-1)
+    bnez    t3, 3b
+```
+
+The loop always runs 8 times, with 6 or 7 instructions each time. It gives the same result as the binary search, so the error is the same too. The result is not correctly rounded, and the contract gives a worst relative error of 0.3884% over the positive normal values.
+
+Result: the cost per call drops from 325.6 instructions (best C build) to 46.1. The worst call over the four builds drops from 626 to 86.
+
+### Results
+
+Cost per call over the bench inputs (instructions):
+
+| | -O1 | -O2 | -O3 | -Os | asm | speedup |
+|---|---|---|---|---|---|---|
+| from_f32 | 11.1 | 12.1 | 13.8 | 12.1 | 11.2 | 0.98x |
+| mul | 95.0 | 95.4 | 96.8 | 96.5 | 65.7 | 1.45x |
+| sqrt | 328.1 | 325.6 | 326.8 | 332.8 | 46.1 | 7.06x |
+
+The conversion shows 0.98x, but both runs actually execute the same total number of instructions. The difference comes from the empty timing loop, which measured 3 instructions lower in the assembly run.
+
+The worst calls of the assembly are 14, 141 and 86 instructions, within the budgets of 60, 400 and 1500. The assembly object takes 536 bytes of `.text`, against 732 bytes for the smallest C build (`-Os`). No version has data sections.
+
+### Verification
+
+`make grade` passes `bf16` at all four levels (`bf16 PASS 15.0/15`). This includes the check that the assembly gives the same results as the C version. `make sanitize` reports no errors.
+
+### Applications
+
+BFloat16 is used to train and run neural networks. There, range matters more than precision. Since BFloat16 keeps the exponent of a 32-bit float, converting between the two only means keeping or dropping the lower 16 bits.
