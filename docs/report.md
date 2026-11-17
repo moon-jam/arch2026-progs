@@ -30,7 +30,7 @@ RV32I has no divider, so Euclid's remainder is out. Stein's binary GCD needs onl
 3. $\gcd(2a, b) = \gcd(a, b)$ for odd $b$
 4. $\gcd(a, b) = \gcd(a, b - a)$ for $b \ge a$
 
-Count the shared factors of two, $k = \operatorname{ctz}(a \mid b)$, and make $a$ odd. Then loop: make $b$ odd, swap so that $a \le b$, and set $b \leftarrow b - a$, until $b = 0$. The answer is `a << k`. Odd minus odd is even, so each pass shifts out at least one bit, which bounds the loop to about 64 passes.
+Count the shared factors of two, $k = \mathrm{ctz}(a \mid b)$, and make $a$ odd. Then loop: make $b$ odd, swap so that $a \le b$, and set $b \leftarrow b - a$, until $b = 0$. The answer is `a << k`. Odd minus odd is even, so each pass shifts out at least one bit, which bounds the loop to about 64 passes.
 
 RV32I also has no ctz instruction. `ctz32` finds the lowest set bit by binary search: test the low 16 bits, then 8, 4, 2 and 1. Its input must be nonzero; `gcd_u32` returns early on a zero operand and leaves the loop when $b$ reaches zero.
 
@@ -69,7 +69,7 @@ Per call is the cost over the bench inputs, worst call is the most expensive cal
      bgeu    a1, a0, .Lnoswap
 ```
 
-The loop is not faster on every input. A call with a single pass that shifts out 31 zeros, such as $a = 1$ and $b = $ `0x80000000`, costs $31 \times 4 + 2 = 126$ instructions in the loop, against at most 22 for v1. The total is bounded, though. $a$ and $b$ have at most 32 binary digits each, 64 together. Each shift drops one digit from $b$, while a subtraction or a swap never adds a digit, and at the end $a$ is at least 1 and keeps one digit. So a whole call shifts out at most 63 zeros, and since every pass after the first shifts out at least one, it runs at most 64 passes. The loop therefore costs at most $4 \times 63 + 2 \times 64 = 380$ instructions per call. It can lose to v1 only on calls with few passes and wins on average, and the measurements below show that it is better in the worst case as well.
+The loop is not faster on every input. A call with a single pass that shifts out 31 zeros, such as $a = 1$ and $b$ = `0x80000000`, costs $31 \times 4 + 2 = 126$ instructions in the loop, against at most 22 for v1. The total is bounded, though. $a$ and $b$ have at most 32 binary digits each, 64 together. Each shift drops one digit from $b$, while a subtraction or a swap never adds a digit, and at the end $a$ is at least 1 and keeps one digit. So a whole call shifts out at most 63 zeros, and since every pass after the first shifts out at least one, it runs at most 64 passes. The loop therefore costs at most $4 \times 63 + 2 \times 64 = 380$ instructions per call. It can lose to v1 only on calls with few passes and wins on average, and the measurements below show that it is better in the worst case as well.
 
 **B. Swap without a temporary.** When $a > b$, the swap is followed by $b \leftarrow b - a$, so the pair that comes out is $(b, a - b)$. Two subtractions form it, in place of three moves and a subtraction:
 
@@ -108,13 +108,13 @@ Source: [`fixed.c`](https://github.com/moon-jam/arch2026-progs/blob/ee11889a0764
 
 ### Principle
 
-**op1** adds two words with logic only. For one bit, `a ^ b` is the sum without the carry and `a & b` is the carry, which belongs one position higher, so $a + b = (a \oplus b) + ((a \mathbin{\&} b) \ll 1)$. That is again an addition, so the loop repeats it until no carry is left. Each pass moves the pending carries up at least one position, so the loop ends within 32 passes. The pass count `*n` is part of the result, which is why op1 keeps the loop instead of a single `add`.
+**op1** adds two words with logic only. For one bit, `a ^ b` is the sum without the carry and `a & b` is the carry, which belongs one position higher, so $a + b = (a \oplus b) + ((a \mathbin{\mathrm{AND}} b) \ll 1)$. That is again an addition, so the loop repeats it until no carry is left. Each pass moves the pending carries up at least one position, so the loop ends within 32 passes. The pass count `*n` is part of the result, which is why op1 keeps the loop instead of a single `add`.
 
 **op2** is $a - b$ modulo $2^{32}$. Building it from op1 as $a + (\lnot b + 1)$ would take two op1 calls, hundreds of instructions, against a budget of 40, so it is the plain subtraction, which wraps the same way.
 
 **op3** is $\lfloor (a + b) / 2 \rfloor$ without overflow. Both operands are halved before the addition, and when both are odd the two dropped halves add up to one, which `a & b & 1` puts back:
 
-$$\left\lfloor \frac{a + b}{2} \right\rfloor = \left\lfloor \frac{a}{2} \right\rfloor + \left\lfloor \frac{b}{2} \right\rfloor + (a \mathbin{\&} b \mathbin{\&} 1)$$
+$$\left\lfloor \frac{a + b}{2} \right\rfloor = \left\lfloor \frac{a}{2} \right\rfloor + \left\lfloor \frac{b}{2} \right\rfloor + (a \mathbin{\mathrm{AND}} b \mathbin{\mathrm{AND}} 1)$$
 
 **q_mul** multiplies two Q11.20 values. A stored integer $A$ represents $A / 2^{20}$: one sign bit, 11 integer bits and 20 fraction bits, so the range is $[-2048, 2048)$ and the resolution $2^{-20} \approx 9.5 \times 10^{-7}$. The product of two values is
 
