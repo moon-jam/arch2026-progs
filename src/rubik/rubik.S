@@ -20,6 +20,11 @@
 # Move names, two bytes each, the second 0 for a one-letter name.
 move_text:
     .ascii  "R\0R2R'B\0B2B'D\0D2D'"
+# Change of the subgroup distance from the change of its remainder,
+# indexed by (new - old) + 2: neighbors differ by at most one, so -2 is +1
+# and +2 is -1 modulo 3.
+delta_table:
+    .byte   1, -1, 0, 1, -1
 
 # Scratch: the parsed permutation and one search frame per depth.
     .section .bss
@@ -231,7 +236,7 @@ root_distance:
 # next_remainder 13, remainder 14 (8-bit).
 # Registers: s0, s1 transition rows; s2 buffer; s3 bound; s4 depth;
 # s5 &frames[depth]; s6 subgroup_offset; s7 subgroup_remainder; s8 face;
-# s9 new remainder; s10 move; s11 permutation_distance.
+# s9 new remainder; s10 delta_table; s11 permutation_distance.
     .align  2
 search:
     addi    sp, sp, -64
@@ -284,6 +289,7 @@ search:
     la      s1, orientation_rows
     la      s6, subgroup_offset
     la      s7, subgroup_remainder
+    la      s10, delta_table
     la      s11, permutation_distance
 .Lsearch_pass:
     li      t0, MAX_DEPTH
@@ -319,14 +325,14 @@ search:
 .Lsearch_try:
     mv      s8, t0              # face
     lbu     t1, 11(s5)
-    bnez    t1, 3f
+    bnez    t1, .Lsearch_turn
     lw      t2, 0(s5)           # first turn: start from the frame's state
     sw      t2, 4(s5)
     lbu     t2, 8(s5)
     sb      t2, 12(s5)
     lbu     t2, 14(s5)
     sb      t2, 13(s5)
-3:
+.Lsearch_turn:
     lhu     a0, 4(s5)           # one more quarter turn of the same face
     lhu     a1, 6(s5)
     slli    t0, s8, 2
@@ -351,29 +357,19 @@ search:
     slli    t2, t2, 1
     srli    t1, t1, 2
     add     t0, s7, t1
-    lbu     a0, 0(t0)
-    srl     a0, a0, t2
-    andi    a0, a0, 3
+    lbu     s9, 0(t0)
+    srl     s9, s9, t2
+    andi    s9, s9, 3           # a0 keeps next_p for the bound below
 
-    mv      s9, a0
-    lbu     t0, 13(s5)          # distances of neighbors differ by one:
-    sub     t1, s9, t0          # a remainder change of -2 is +1, +2 is -1
-    li      t2, -2
-    bne     t1, t2, 4f
-    li      t1, 1
-4:
-    li      t2, 2
-    bne     t1, t2, 5f
-    li      t1, -1
-5:
+    lbu     t0, 13(s5)          # distance change from the remainder change
+    sub     t1, s9, t0
+    add     t1, t1, s10
+    lb      t1, 2(t1)
     lbu     t2, 12(s5)
     add     t2, t2, t1
     sb      t2, 12(s5)
     sb      s9, 13(s5)
-    lbu     t0, 11(s5)          # move = 3 * face + turn
-    slli    t1, s8, 1
-    add     t1, t1, s8
-    add     s10, t1, t0
+    lbu     t0, 11(s5)          # advance the turn, then the face
     addi    t0, t0, 1
     li      t1, 3
     blt     t0, t1, 6f
@@ -387,9 +383,8 @@ search:
 7:
     addi    t0, s4, 1           # prune: depth + 1 + distance > bound
     add     t1, t0, t2
-    blt     s3, t1, .Lsearch_node
-    lhu     a0, 4(s5)           # prune on the permutation bound too
-    srli    t1, a0, 1
+    blt     s3, t1, .Lsearch_retry
+    srli    t1, a0, 1           # prune on the permutation bound too
     andi    t2, a0, 1
     slli    t2, t2, 2
     add     t1, s11, t1
@@ -397,10 +392,18 @@ search:
     srl     a0, a0, t2
     andi    a0, a0, 15
     add     t1, t0, a0
-    blt     s3, t1, .Lsearch_node
+    blt     s3, t1, .Lsearch_retry
 
-    add     t1, s2, s4
-    sb      s10, 1(t1)          # record the move
+    lbu     t1, 11(s5)          # record move 3 * face + turn; the turn has
+    addi    t1, t1, -1          # already advanced, and wrapped after 2
+    bgez    t1, 9f
+    li      t1, 2
+9:
+    slli    t2, s8, 1
+    add     t2, t2, s8
+    add     t1, t1, t2
+    add     t2, s2, s4
+    sb      t1, 1(t2)
     lhu     t1, 4(s5)
     bnez    t1, 8f
     lhu     t1, 6(s5)
@@ -421,6 +424,10 @@ search:
     sb      s9, 14(t1)
     addi    s4, s4, 1
     mv      s5, t1
+    j       .Lsearch_node
+.Lsearch_retry:                 # pruned: the same face again if turns remain
+    lbu     t1, 11(s5)
+    bnez    t1, .Lsearch_turn
     j       .Lsearch_node
 .Lsearch_next_pass:
     addi    s3, s3, 1           # the whole pass failed: raise the bound
