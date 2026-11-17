@@ -51,25 +51,6 @@ half_remainder:
     andi    a0, a0, 3
     ret
 
-# quarter_rank(p, o, face): one quarter turn of a face (R = 0, B = 1, D = 2).
-#   a0 = p, a1 = o, a2 = face -> a0 = new p, a1 = new o
-    .align  2
-quarter_rank:
-    slli    t0, a2, 2           # row address: permutation_rows[face]
-    la      t1, permutation_rows
-    add     t1, t1, t0
-    lw      t1, 0(t1)
-    slli    t2, a0, 1
-    add     t1, t1, t2
-    lhu     a0, 0(t1)
-    la      t1, orientation_rows
-    add     t1, t1, t0
-    lw      t1, 0(t1)
-    slli    t2, a1, 1
-    add     t1, t1, t2
-    lhu     a1, 0(t1)
-    ret
-
 # parse_encode(input): check PPPPPPPOOOOOOO and rank it.
 #   a0 = input -> a0 = p, a1 = o; a0 = -2 if the state is invalid
 # A leaf: only caller-saved registers. Reading stops at the first bad
@@ -123,37 +104,46 @@ parse_encode:
     andi    t3, t3, 1
     beqz    t3, .Lparse_bad
 
-    mv      a1, t1              # Lehmer rank of the permutation
-    li      a0, 0
-    li      t2, 0               # i
+    mv      a1, t1
+    li      t2, 0               # i: Lehmer digit of p[i], stored over p[i]
 .Lrank_outer:
     add     t3, t0, t2
     lbu     t4, 0(t3)           # p[i]
     addi    t5, t2, 1           # j
     li      t6, 0               # later entries smaller than p[i]
 .Lrank_inner:
-    li      t1, 7
-    bge     t5, t1, .Lrank_digit
     add     t1, t0, t5
     lbu     t1, 0(t1)
     sltu    t1, t1, t4
     add     t6, t6, t1
     addi    t5, t5, 1
-    j       .Lrank_inner
-.Lrank_digit:
-    li      t1, 7               # rank = (7 - i) * rank + digit, by addition
-    sub     t1, t1, t2
-    li      t3, 0
-.Lrank_mul:
-    beqz    t1, .Lrank_add
-    add     t3, t3, a0
-    addi    t1, t1, -1
-    j       .Lrank_mul
-.Lrank_add:
-    add     a0, t3, t6
+    li      t1, 7
+    blt     t5, t1, .Lrank_inner
+    sb      t6, 0(t3)           # p[i] is not needed by later digits
     addi    t2, t2, 1
     li      t1, 6
     blt     t2, t1, .Lrank_outer
+
+    lbu     a0, 0(t0)           # radices 7, 6, 5, 4, 3, 2 by shifts and adds
+    lbu     t1, 1(t0)
+    slli    t2, a0, 2           # 6p + d
+    slli    a0, a0, 1
+    add     a0, a0, t2
+    add     a0, a0, t1
+    lbu     t1, 2(t0)
+    slli    t2, a0, 2           # 5p + d
+    add     a0, a0, t2
+    add     a0, a0, t1
+    lbu     t1, 3(t0)
+    slli    a0, a0, 2           # 4p + d
+    add     a0, a0, t1
+    lbu     t1, 4(t0)
+    slli    t2, a0, 1           # 3p + d
+    add     a0, a0, t2
+    add     a0, a0, t1
+    lbu     t1, 5(t0)
+    slli    a0, a0, 1           # 2p + d
+    add     a0, a0, t1
     ret
 .Lparse_bad:
     li      a0, -2
@@ -162,76 +152,75 @@ parse_encode:
 # root_distance(p, o, r): exact distance to the subgroup, from its value
 # modulo 3. Walk down by always taking a move that lowers the remainder.
 #   a0 = p, a1 = o, a2 = remainder -> a0 = distance, or -1
+# A leaf with the lookups inlined; the rows of a face are loaded once.
+#   a3 steps    a4 wanted remainder    a5 face    a6, a7 candidate p, o
+#   t0 turn     t3, t4 rows of the face    t5 subgroup_offset
+#   t6 subgroup_remainder    t1, t2 scratch
     .align  2
 root_distance:
-    addi    sp, sp, -48
-    sw      ra, 44(sp)
-    sw      s0, 40(sp)
-    sw      s1, 36(sp)
-    sw      s2, 32(sp)
-    sw      s3, 28(sp)
-    sw      s4, 24(sp)
-    sw      s5, 20(sp)
-    sw      s6, 16(sp)
-    mv      s0, a0              # current p
-    mv      s1, a1              # current o
-    mv      s2, a2              # remainder
-    li      s3, 0               # steps
+    li      a3, 0
+    la      t5, subgroup_offset
+    la      t6, subgroup_remainder
 .Lroot_loop:
-    la      t0, subgroup_offset # in the subgroup: offset[p] == 0 and o == 0
-    slli    t1, s0, 2
-    add     t0, t0, t1
-    lw      t0, 0(t0)
-    bnez    t0, .Lroot_step
-    beqz    s1, .Lroot_done
+    slli    t1, a0, 2           # in the subgroup: offset[p] == 0 and o == 0
+    add     t1, t5, t1
+    lw      t1, 0(t1)
+    bnez    t1, .Lroot_step
+    beqz    a1, .Lroot_done
 .Lroot_step:
-    addi    s4, s2, -1          # wanted remainder: one less, modulo 3
-    bgez    s4, 1f
-    li      s4, 2
+    addi    a4, a2, -1          # wanted remainder: one less, modulo 3
+    bgez    a4, 1f
+    li      a4, 2
 1:
-    li      s5, 0               # face
+    li      a5, 0
 .Lroot_face:
-    mv      s6, s0              # candidate p
-    sw      s1, 12(sp)          # candidate o
-    sw      zero, 8(sp)         # turn
+    slli    t1, a5, 2           # rows of this face
+    la      t2, permutation_rows
+    add     t2, t2, t1
+    lw      t3, 0(t2)
+    la      t2, orientation_rows
+    add     t2, t2, t1
+    lw      t4, 0(t2)
+    mv      a6, a0
+    mv      a7, a1
+    li      t0, 0
 .Lroot_turn:
-    mv      a0, s6
-    lw      a1, 12(sp)
-    mv      a2, s5
-    call    quarter_rank
-    mv      s6, a0
-    sw      a1, 12(sp)
-    call    half_remainder
-    beq     a0, s4, .Lroot_found
-    lw      t0, 8(sp)
+    slli    t1, a6, 1           # one more quarter turn
+    add     t1, t3, t1
+    lhu     a6, 0(t1)
+    slli    t1, a7, 1
+    add     t1, t4, t1
+    lhu     a7, 0(t1)
+    slli    t1, a6, 2           # its remainder
+    add     t1, t5, t1
+    lw      t1, 0(t1)
+    add     t1, t1, a7
+    andi    t2, t1, 3
+    slli    t2, t2, 1
+    srli    t1, t1, 2
+    add     t1, t6, t1
+    lbu     t1, 0(t1)
+    srl     t1, t1, t2
+    andi    t1, t1, 3
+    beq     t1, a4, .Lroot_found
     addi    t0, t0, 1
-    sw      t0, 8(sp)
     li      t1, 3
     blt     t0, t1, .Lroot_turn
-    addi    s5, s5, 1
-    li      t0, 3
-    blt     s5, t0, .Lroot_face
-    j       .Lroot_fail
+    addi    a5, a5, 1
+    blt     a5, t1, .Lroot_face
+    li      a0, -1              # no move lowers it: not a valid state
+    ret
 .Lroot_found:
-    mv      s0, s6
-    lw      s1, 12(sp)
-    mv      s2, s4
-    addi    s3, s3, 1
-    li      t0, MAX_DEPTH
-    ble     s3, t0, .Lroot_loop
-.Lroot_fail:
-    li      s3, -1
+    mv      a0, a6
+    mv      a1, a7
+    mv      a2, a4
+    addi    a3, a3, 1
+    li      t1, MAX_DEPTH
+    ble     a3, t1, .Lroot_loop
+    li      a0, -1
+    ret
 .Lroot_done:
-    mv      a0, s3
-    lw      s6, 16(sp)
-    lw      s5, 20(sp)
-    lw      s4, 24(sp)
-    lw      s3, 28(sp)
-    lw      s2, 32(sp)
-    lw      s1, 36(sp)
-    lw      s0, 40(sp)
-    lw      ra, 44(sp)
-    addi    sp, sp, 48
+    mv      a0, a3
     ret
 
 # search(p, o, moves): IDA* with explicit frames.
