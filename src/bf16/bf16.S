@@ -49,60 +49,71 @@ bf16_mul_asm:
     andi    t0, t0, 0xFF
     srli    t1, a1, 7
     andi    t1, t1, 0xFF
-    li      t2, 0xFF
-    beq     t0, t2, .Lmul_a_special   # a first, then b
-    beq     t1, t2, .Lmul_b_special
-    slli    t3, a0, 17          # a is zero (either sign)?
-    beqz    t3, .Lmul_zero
-    slli    t3, a1, 17
-    beqz    t3, .Lmul_zero
-
+    li      t2, 254             # an exponent in 1..254 means a normal
+    addi    t3, t0, -1          # operand: exponent 0 wraps to a huge value
+    bgeu    t3, t2, .Lmul_a_odd # and 0xFF gives exactly 254
     andi    a2, a0, 0x7F
+    ori     a2, a2, 0x80        # a is normal: restore its leading one
+.Lmul_b_check:
+    addi    t3, t1, -1
+    bgeu    t3, t2, .Lmul_b_odd
     andi    a3, a1, 0x7F
-    beqz    t0, .Lmul_norm_a    # subnormal a: find its leading one
-    ori     a2, a2, 0x80        # normal a: restore the leading one
-.Lmul_b:
-    beqz    t1, .Lmul_norm_b
-    ori     a3, a3, 0x80
+    ori     a3, a3, 0x80        # b is normal too
 .Lmul_prod:
     add     t4, t0, t1
     addi    t4, t4, -127        # both exponents carry the bias once
 
+    blt     t2, t4, .Lmul_inf   # t2 is 254 on both paths
+    slti    t3, t4, -6          # even a carry leaves a zero fraction
+    bnez    t3, .Lmul_zero
+
     li      a4, 0               # 8 x 8 bit product by shift and add
+    li      t3, 1               # the normalized multiplier ends with a known 1
 1:
-    andi    t3, a3, 1
-    beqz    t3, 2f
+    andi    t0, a3, 1
+    beqz    t0, 2f
     add     a4, a4, a2
 2:
     slli    a2, a2, 1
     srli    a3, a3, 1
-    bnez    a3, 1b
+    bne     a3, t3, 1b
+    add     a4, a4, a2          # the leading one always contributes
 
     srli    t3, a4, 15          # product in [2^14, 2^16): one bit to fix
     beqz    t3, 3f
+    beq     t4, t2, .Lmul_inf   # only a carry from 254 can overflow now
     srli    a4, a4, 1
     addi    t4, t4, 1
 3:
     srli    a4, a4, 7           # truncate to 7 fraction bits
     andi    a4, a4, 0x7F
-    li      t2, 0xFF
-    bge     t4, t2, .Lmul_inf
     blez    t4, .Lmul_sub
     slli    t4, t4, 7
     or      a0, t6, t4
     or      a0, a0, a4
     ret
 
-.Lmul_norm_a:                   # shift up until bit 7 is set
-    li      t0, 1
-4:
+.Lmul_a_odd:                    # a is zero, subnormal, Inf or NaN
+    beq     t3, t2, .Lmul_a_special   # exponent 0xFF: a is checked first
+    li      t4, 0xFF            # a has exponent 0, so b's Inf or NaN
+    beq     t1, t4, .Lmul_b_special   # comes before a's zero
+    andi    a2, a0, 0x7F
+    beqz    a2, .Lmul_zero      # a is zero
+    slli    t3, a1, 17
+    beqz    t3, .Lmul_zero      # b is zero
+    li      t0, 1               # a is subnormal: shift it up until bit 7
+4:                              # is set, lowering its exponent each time
     slli    a2, a2, 1
     addi    t0, t0, -1
     andi    t3, a2, 0x80
     beqz    t3, 4b
-    j       .Lmul_b
-.Lmul_norm_b:
-    li      t1, 1
+    j       .Lmul_b_check       # b may still be subnormal
+
+.Lmul_b_odd:                    # a is normalized, b is zero, subnormal, Inf or NaN
+    beq     t3, t2, .Lmul_b_special   # exponent 0xFF: Inf or NaN
+    andi    a3, a1, 0x7F
+    beqz    a3, .Lmul_zero      # b is zero
+    li      t1, 1               # b is subnormal: shift it up the same way
 5:
     slli    a3, a3, 1
     addi    t1, t1, -1
@@ -111,8 +122,6 @@ bf16_mul_asm:
     j       .Lmul_prod
 
 .Lmul_sub:                      # exponent <= 0: subnormal or zero
-    li      t2, -6
-    blt     t4, t2, .Lmul_zero
     li      t2, 1
     sub     t2, t2, t4
     srl     a4, a4, t2          # shift the fraction right 1 - exponent

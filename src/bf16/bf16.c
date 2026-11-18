@@ -36,37 +36,51 @@ uint16_t bf16_mul(uint16_t a, uint16_t b)
     int32_t exp_a = (a >> 7) & 0xFF, exp_b = (b >> 7) & 0xFF;
     uint32_t mant_a = a & 0x7Fu, mant_b = b & 0x7Fu;
 
-    if (exp_a == 0xFF)
-        return mul_special(a, b, sign);
-    if (exp_b == 0xFF)
-        return mul_special(b, a, sign);
-    if (!(a & 0x7FFFu) || !(b & 0x7FFFu))
-        return sign; /* zero times a finite value */
-
-    /* Restore the leading one; a denormal is shifted up until it has one. */
-    int32_t exp_adjust = 0;
-    if (exp_a) {
+    int32_t exp = exp_a + exp_b - BF16_BIAS;
+    if ((uint32_t) (exp_a - 1) < 254 && (uint32_t) (exp_b - 1) < 254) {
         mant_a |= 0x80u;
-    } else {
-        while (!(mant_a & 0x80u)) {
-            mant_a <<= 1;
-            exp_adjust--;
-        }
-        exp_a = 1;
-    }
-    if (exp_b) {
         mant_b |= 0x80u;
     } else {
-        while (!(mant_b & 0x80u)) {
-            mant_b <<= 1;
-            exp_adjust--;
+        if (exp_a == 0xFF)
+            return mul_special(a, b, sign);
+        if (exp_b == 0xFF)
+            return mul_special(b, a, sign);
+        if (!(a & 0x7FFFu) || !(b & 0x7FFFu))
+            return sign; /* zero times a finite value */
+
+        /* Restore the leading one; a denormal is shifted up until it has
+         * one.
+         */
+        if (exp_a) {
+            mant_a |= 0x80u;
+        } else {
+            while (!(mant_a & 0x80u)) {
+                mant_a <<= 1;
+                exp--;
+            }
+            exp++; /* subnormal exponent field counts as one */
         }
-        exp_b = 1;
+        if (exp_b) {
+            mant_b |= 0x80u;
+        } else {
+            while (!(mant_b & 0x80u)) {
+                mant_b <<= 1;
+                exp--;
+            }
+            exp++;
+        }
     }
+
+    /* The product can raise exp by at most one. At -6, even the largest
+     * seven-bit fraction shifts to zero under the contract.
+     */
+    if (exp < -6)
+        return sign;
+    if (exp >= 255)
+        return sign | BF16_INF;
 
     /* 8 x 8 bits: the product is in [2^14, 2^16), one bit to renormalize. */
     uint32_t mant = mant_a * mant_b;
-    int32_t exp = exp_a + exp_b - BF16_BIAS + exp_adjust;
     if (mant & 0x8000u) {
         mant = (mant >> 8) & 0x7Fu;
         exp++;
@@ -77,8 +91,6 @@ uint16_t bf16_mul(uint16_t a, uint16_t b)
     if (exp >= 0xFF)
         return sign | BF16_INF;
     if (exp <= 0) {
-        if (exp < -6)
-            return sign;
         mant >>= 1 - exp;
         exp = 0;
     }
